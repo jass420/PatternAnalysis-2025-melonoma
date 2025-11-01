@@ -25,14 +25,14 @@ CATALOG_CSV = BASE / "train_mapping.csv"
 OUT_DIR     = BASE / "outputs"; OUT_DIR.mkdir(exist_ok=True)
 
 IMG_SIZE        = 224       # Good balance of quality and speed
-EPOCHS          = 10        # Good balance for convergence
+EPOCHS          = 15        # Good balance for convergence
 BATCH_SIZE      = 64        # REDUCED for faster training (still good GPU usage)
 PAIRS_TRAIN     = 6000      # REDUCED for faster epochs but still enough data
 PAIRS_VAL       = 1200      # REDUCED proportionally
 LR              = 5e-4
 MARGIN          = 2.0
 SEED            = 42
-NUM_WORKERS     = 2         # REDUCED to avoid memory errors
+NUM_WORKERS     = 3         # REDUCED to avoid memory errors
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
 PREFETCH_FACTOR = 4         # REDUCED (less memory overhead)
 
@@ -64,6 +64,90 @@ def load_dicom_rgb(path: str) -> np.ndarray:
     if arr.max() > 0: arr /= arr.max()
     img = (arr * 255).clip(0, 255).astype(np.uint8)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+# ---------- Hard Negative Mining (COMMENTED OUT - decreased accuracy) ----------
+# @torch.no_grad()
+# def mine_hard_pairs(model, df, device, top_k=2000):
+#     """
+#     Mine hard pairs by finding:
+#     - Hard negatives: Different classes but close in embedding space
+#     - Hard positives: Same class but far in embedding space
+#     """
+#     print("  [Mining hard pairs...]")
+#
+#     # Prepare dataset and loader
+#     dataset = ImageDataset(df, size=IMG_SIZE)
+#     loader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=2, pin_memory=True)
+#
+#     # Compute all embeddings
+#     model.eval()
+#     all_embeds = []
+#     all_labels = []
+#     for x, y in loader:
+#         x = x.to(device)
+#         z = model(x).cpu().numpy()
+#         all_embeds.append(z)
+#         all_labels.append(y.numpy())
+#
+#     embeds = np.vstack(all_embeds)
+#     labels = np.concatenate(all_labels)
+#
+#     # Find hard pairs
+#     hard_pairs = []
+#
+#     # Sample a subset for efficiency
+#     n_samples = min(5000, len(df))
+#     sample_indices = np.random.choice(len(df), n_samples, replace=False)
+#
+#     for i in sample_indices[:1000]:
+#         dists = np.linalg.norm(embeds - embeds[i], axis=1)
+#
+#         # Hard negatives: different class but close (distance < 1.5)
+#         diff_class_mask = labels != labels[i]
+#         diff_class_indices = np.where(diff_class_mask)[0]
+#         if len(diff_class_indices) > 0:
+#             diff_class_dists = dists[diff_class_indices]
+#             hard_neg_idx = diff_class_indices[diff_class_dists < 1.5]
+#             for j in hard_neg_idx[:3]:
+#                 hard_pairs.append((i, j, 0.0))
+#
+#         # Hard positives: same class but far (distance > 0.8)
+#         same_class_mask = (labels == labels[i]) & (np.arange(len(labels)) != i)
+#         same_class_indices = np.where(same_class_mask)[0]
+#         if len(same_class_indices) > 0:
+#             same_class_dists = dists[same_class_indices]
+#             hard_pos_idx = same_class_indices[same_class_dists > 0.8]
+#             for j in hard_pos_idx[:2]:
+#                 hard_pairs.append((i, j, 1.0))
+#
+#     print(f"  [Found {len(hard_pairs)} hard pairs]")
+#     return hard_pairs
+#
+# def make_hard_augmented_pairs(df, n_pairs, hard_pairs, hard_ratio=0.5, seed=None):
+#     """
+#     Create pairs with mix of hard mined pairs and random pairs.
+#     hard_ratio: Fraction of pairs that should be hard (0.5 = 50% hard, 50% random)
+#     """
+#     n_hard = int(n_pairs * hard_ratio)
+#     n_random = n_pairs - n_hard
+#
+#     # Sample hard pairs
+#     if len(hard_pairs) > 0:
+#         hard_sample_indices = np.random.choice(len(hard_pairs), min(n_hard, len(hard_pairs)), replace=False)
+#         sampled_hard = [hard_pairs[i] for i in hard_sample_indices]
+#         while len(sampled_hard) < n_hard:
+#             sampled_hard.append(random.choice(hard_pairs))
+#     else:
+#         sampled_hard = []
+#         n_random = n_pairs
+#
+#     # Create random pairs
+#     random_pairs = make_random_pairs(df, n_random, seed=seed)
+#
+#     # Combine and shuffle
+#     all_pairs = sampled_hard + random_pairs
+#     random.shuffle(all_pairs)
+#     return all_pairs
 
 # ---------- Pair-making helpers ----------
 def make_fixed_pairs(df, n_pos_each=300, n_neg=300, seed=SEED):
