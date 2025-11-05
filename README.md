@@ -13,3 +13,21 @@ Target Accuracy: ~80% on test set
 Siamese Network Algorithm
 Architecture Overview
 The Siamese network uses a twin neural network architecture with shared weights to learn similarity between image pairs.
+
+**Algorithm description**
+
+**dependencies**
+
+**Confusion Matrix:**
+
+
+Confusion Matrix:
+[[1598  374]
+ [  22    6]]
+  [Normal→Normal, Normal→Melanoma]
+  [Melanoma→Normal, Melanoma→Melanoma]
+
+**Pre-processing**
+
+**Training, validation, split justification**
+
