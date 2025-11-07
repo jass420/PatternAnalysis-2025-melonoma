@@ -1,232 +1,360 @@
-# train_only.py
-import os, random
+"""
+train.py - Training, Validation, Testing and Model Saving
+
+This script trains the Siamese network on ISIC 2020 melanoma dataset,
+validates during training, tests on validation set, and saves the best model.
+
+Plots training/validation losses and metrics throughout training.
+"""
+
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import pydicom, cv2
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import models
-
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+from torch.utils.data import DataLoader
 from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
 
-# ============== CONFIG ==============
-BASE        = Path(r"C:\Users\mjas0\OneDrive\Desktop\courses\COMP3710\Alzheimer-s")
-CATALOG_CSV = BASE / "train_mapping.csv"  # built earlier
-OUT_DIR     = BASE / "outputs"; OUT_DIR.mkdir(exist_ok=True)
+# Import from custom modules
+from modules import SiameseNet, ContrastiveLoss, PrototypeClassifier
+from dataset import SiamesePairs, ImageDataset, make_fixed_pairs, make_random_pairs
 
-IMG_SIZE        = 256
-EPOCHS          = 10
-BATCH_SIZE      = 32
-PAIRS_TRAIN     = 25000     # pairs per epoch (train)
-PAIRS_VAL       = 5000      # fixed val pairs
-LR              = 1e-3
-MARGIN          = 1.0
-SEED            = 42
-NUM_WORKERS     = 0         # Windows-safe; raise if stable
-DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
-# ====================================
+# ============== CONFIGURATION ==============
+BASE = Path(r"C:\Users\mjas0\OneDrive\Desktop\courses\COMP3710\Alzheimer-s")
+CATALOG_CSV = BASE / "train_mapping.csv"
+OUT_DIR = BASE / "outputs"
+OUT_DIR.mkdir(exist_ok=True)
 
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+# Hyperparameters
+IMG_SIZE = 224
+EPOCHS = 12
+BATCH_SIZE = 64
+PAIRS_TRAIN = 6000
+PAIRS_VAL = 1200
+LR = 5e-4
+MARGIN = 2.0
+SEED = 42
+NUM_WORKERS = 2
+PREFETCH_FACTOR = 2
 
-# ---------- DICOM loader ----------
-def load_dicom_rgb(path: str) -> np.ndarray:
-    ds = pydicom.dcmread(path)
-    arr = ds.pixel_array.astype(np.float32)
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    arr -= arr.min()
-    if arr.max() > 0: arr /= arr.max()
-    img = (arr * 255).clip(0, 255).astype(np.uint8)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # ensure RGB
+# Device
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}\n")
 
-# ---------- Pair-making helpers ----------
-def make_fixed_pairs(df, n_pos_each=1000, n_neg=3000, seed=SEED):
-    """Build a deterministic list of pairs for validation."""
-    rng = random.Random(seed)
-    idx0 = df.index[df.target == 0].tolist()
-    idx1 = df.index[df.target == 1].tolist()
-    pairs = []
-    # positives: balanced across classes (as much as possible)
-    def sample_pos(pool, n):
-        out = []
-        if len(pool) < 2:
-            return out
-        for _ in range(n):
-            i1, i2 = rng.sample(pool, 2)
-            out.append((i1, i2, 1.0))
-        return out
+# Set random seeds
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
-    pairs += sample_pos(idx0, n_pos_each)
-    pairs += sample_pos(idx1, n_pos_each)
-    # negatives
-    for _ in range(n_neg):
-        i1 = rng.choice(idx0); i2 = rng.choice(idx1)
-        pairs.append((i1, i2, 0.0))
-    rng.shuffle(pairs)
-    return pairs
 
-def make_random_pairs(df, n_pairs, seed=None):
-    """Fresh random pairs for training each epoch."""
-    rng = random.Random(seed)
-    idx0 = df.index[df.target == 0].tolist()
-    idx1 = df.index[df.target == 1].tolist()
-    pairs = []
-    for _ in range(n_pairs):
-        if rng.random() < 0.5:
-            # positive: pick a class first to balance
-            cls = rng.choice([0, 1])
-            pool = idx0 if cls == 0 else idx1
-            if len(pool) >= 2:
-                i1, i2 = rng.sample(pool, 2)
-            else:
-                i1 = i2 = pool[0]
-            pairs.append((i1, i2, 1.0))
-        else:
-            i1 = rng.choice(idx0); i2 = rng.choice(idx1)
-            pairs.append((i1, i2, 0.0))
-    rng.shuffle(pairs)
-    return pairs
+def split_train_val(df, test_size=0.2, seed=SEED):
+    """
+    Split data into train/validation sets grouped by patient_id.
 
-# ---------- Datasets ----------
-class SiamesePairs(Dataset):
-    def __init__(self, df, pairs, size=256, augment=True):
-        self.df = df.reset_index(drop=True)
-        self.pairs = pairs
-        if augment:
-            tf = [
-                A.RandomResizedCrop(size, size, scale=(0.85,1.0), ratio=(0.9,1.1)),
-                A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.5),
-                A.ShiftScaleRotate(0.05, 0.15, 25, p=0.7),
-                A.RandomBrightnessContrast(p=0.5),
-                A.CLAHE(p=0.2),
-                A.Normalize(), ToTensorV2()
-            ]
-        else:
-            tf = [A.Resize(size, size), A.Normalize(), ToTensorV2()]
-        self.tf = A.Compose(tf)
+    This prevents data leakage by ensuring samples from the same patient
+    don't appear in both train and validation sets.
+    """
+    assert 'patient_id' in df.columns, "DataFrame must have 'patient_id' column"
 
-    def __len__(self): return len(self.pairs)
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    train_idx, val_idx = next(gss.split(df, groups=df['patient_id']))
 
-    def __getitem__(self, i):
-        i1, i2, y = self.pairs[i]
-        p1 = self.df.dcm_path.iloc[i1]
-        p2 = self.df.dcm_path.iloc[i2]
-        img1 = load_dicom_rgb(p1); img2 = load_dicom_rgb(p2)
-        x1 = self.tf(image=img1)["image"]
-        x2 = self.tf(image=img2)["image"]
-        return x1, x2, torch.tensor(y, dtype=torch.float32)
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
 
-# ---------- Model ----------
-class SiameseNet(nn.Module):
-    def __init__(self, embed_dim=128):
-        super().__init__()
-        try:
-            backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        except Exception:
-            backbone = models.resnet18(pretrained=True)
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
-        self.head = nn.Sequential(
-            nn.Linear(512, 512), nn.ReLU(inplace=True),
-            nn.Linear(512, embed_dim)
-        )
-    def forward(self, x):
-        f = self.backbone(x)
-        z = self.head(f)
-        return F.normalize(z, dim=1)
+    return train_df, val_df
 
-def contrastive_loss(z1, z2, y, margin=MARGIN):
-    d = F.pairwise_distance(z1, z2)
-    pos = y * (d ** 2)
-    neg = (1 - y) * (F.relu(margin - d) ** 2)
-    return (pos + neg).mean()
 
-# ---------- Split ----------
-def split_train_val(df, seed=SEED):
-    assert 'patient_id' in df.columns, "train_mapping.csv needs 'patient_id'."
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    tr_idx, va_idx = next(gss.split(df, groups=df['patient_id']))
-    return df.iloc[tr_idx].reset_index(drop=True), df.iloc[va_idx].reset_index(drop=True)
+@torch.no_grad()
+def compute_embeddings(model, dataloader, device):
+    """Compute embeddings for all samples in a dataloader."""
+    model.eval()
+    all_embeds = []
+    all_labels = []
 
-# ---------- Training ----------
+    for x, y in dataloader:
+        x = x.to(device)
+        z = model(x).cpu().numpy()
+        all_embeds.append(z)
+        all_labels.append(y.numpy())
+
+    return np.vstack(all_embeds), np.concatenate(all_labels)
+
+
+def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, epoch):
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+
+    for batch_idx, (x1, x2, y) in enumerate(dataloader, 1):
+        x1, x2, y = x1.to(device), x2.to(device), y.to(device)
+
+        optimizer.zero_grad()
+
+        # Mixed precision training
+        with torch.amp.autocast(device, enabled=(device == "cuda")):
+            z1 = model(x1)
+            z2 = model(x2)
+            loss = criterion(z1, z2, y)
+
+        # Backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+
+        # Print progress every 10 batches
+        if batch_idx % 10 == 0:
+            print(f"  Batch {batch_idx}/{len(dataloader)} | Loss: {loss.item():.4f}")
+
+    return total_loss / len(dataloader)
+
+
+@torch.no_grad()
+def validate(model, dataloader, criterion, device):
+    """Validate the model."""
+    model.eval()
+    total_loss = 0.0
+
+    for x1, x2, y in dataloader:
+        x1, x2, y = x1.to(device), x2.to(device), y.to(device)
+
+        with torch.amp.autocast(device, enabled=(device == "cuda")):
+            z1 = model(x1)
+            z2 = model(x2)
+            loss = criterion(z1, z2, y)
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+
+def plot_training_history(train_losses, val_losses, save_path):
+    """Plot training and validation losses."""
+    plt.figure(figsize=(10, 6))
+    epochs_range = range(1, len(train_losses) + 1)
+
+    plt.plot(epochs_range, train_losses, 'b-o', label='Training Loss', linewidth=2)
+    plt.plot(epochs_range, val_losses, 'r-o', label='Validation Loss', linewidth=2)
+
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Contrastive Loss', fontsize=12)
+    plt.title('Training and Validation Losses', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Loss plot saved to: {save_path}")
+    plt.close()
+
+
+def plot_confusion_matrix(cm, save_path):
+    """Plot confusion matrix."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    im = ax.imshow(cm, cmap='Blues')
+    ax.figure.colorbar(im, ax=ax)
+
+    # Labels
+    classes = ['Normal', 'Melanoma']
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(classes)
+    ax.set_yticklabels(classes)
+
+    # Annotate cells
+    for i in range(2):
+        for j in range(2):
+            text = ax.text(j, i, cm[i, j],
+                          ha="center", va="center",
+                          color="white" if cm[i, j] > cm.max() / 2 else "black",
+                          fontsize=20, fontweight='bold')
+
+    ax.set_xlabel('Predicted', fontsize=12)
+    ax.set_ylabel('True', fontsize=12)
+    ax.set_title('Confusion Matrix', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Confusion matrix plot saved to: {save_path}")
+    plt.close()
+
+
 def main():
+    """Main training pipeline."""
+    print("="*70)
+    print("SIAMESE NETWORK TRAINING - ISIC 2020 MELANOMA CLASSIFICATION")
+    print("="*70)
+    print()
+
+    # Load data
+    print("Loading dataset...")
     df = pd.read_csv(CATALOG_CSV)
-    need = {'image_name','dcm_path','target','patient_id'}
-    miss = need - set(df.columns)
-    if miss:
-        raise SystemExit(f"Missing columns in train_mapping.csv: {miss}")
-
     train_df, val_df = split_train_val(df)
-    print(f"train: {len(train_df)}   val: {len(val_df)}")
-    print("class balance (train):", dict(train_df['target'].value_counts()))
 
-    # fixed val pairs (deterministic)
-    val_pairs = make_fixed_pairs(val_df,
-                                 n_pos_each=max(500, PAIRS_VAL//4),
-                                 n_neg=max(1000, PAIRS_VAL//2),
-                                 seed=SEED)
-    val_ds = SiamesePairs(val_df, val_pairs, size=IMG_SIZE, augment=False)
-    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
-                        num_workers=NUM_WORKERS, pin_memory=True)
+    print(f"Train samples: {len(train_df)}")
+    print(f"Validation samples: {len(val_df)}")
+    print()
 
-    net = SiameseNet(embed_dim=128).to(DEVICE)
-    opt = torch.optim.AdamW(net.parameters(), lr=LR)
-    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE == "cuda"))
+    # Create validation pairs (fixed for consistent evaluation)
+    val_pairs = make_fixed_pairs(val_df, n_pos_each=300, n_neg=600, seed=SEED)
+    val_dataset = SiamesePairs(val_df, val_pairs, size=IMG_SIZE, augment=False)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+        persistent_workers=True if NUM_WORKERS > 0 else False
+    )
 
-    best_val = float("inf"); best_path = OUT_DIR / "best.pt"
+    # Initialize model
+    print("Initializing model...")
+    model = SiameseNet(embed_dim=512).to(DEVICE)
+    criterion = ContrastiveLoss(margin=MARGIN)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    scaler = torch.amp.GradScaler(DEVICE, enabled=(DEVICE == "cuda"))
 
-    for epoch in range(1, EPOCHS+1):
-        # fresh random pairs each epoch for training
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params / 1e6:.2f}M")
+    print()
+
+    # Training loop
+    print("="*70)
+    print("TRAINING")
+    print("="*70)
+    print()
+
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    best_model_path = OUT_DIR / "best_siamese.pth"
+
+    for epoch in range(1, EPOCHS + 1):
+        print(f"Epoch {epoch}/{EPOCHS}")
+        print("-" * 70)
+
+        # Create random training pairs for this epoch
         train_pairs = make_random_pairs(train_df, PAIRS_TRAIN, seed=SEED + epoch)
-        train_ds = SiamesePairs(train_df, train_pairs, size=IMG_SIZE, augment=True)
-        train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+        train_dataset = SiamesePairs(train_df, train_pairs, size=IMG_SIZE, augment=True)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            drop_last=True,
+            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+            persistent_workers=True if NUM_WORKERS > 0 else False
+        )
 
-        # ---- train ----
-        net.train()
-        tr_loss = 0.0
-        for x1, x2, y in train_dl:
-            x1 = x1.to(DEVICE, non_blocking=True)
-            x2 = x2.to(DEVICE, non_blocking=True)
-            y  = y.to(DEVICE, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(DEVICE=="cuda")):
-                z1, z2 = net(x1), net(x2)
-                loss = contrastive_loss(z1, z2, y)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            tr_loss += loss.item()
-        tr_loss /= len(train_dl)
+        # Train
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, epoch)
+        train_losses.append(train_loss)
 
-        # ---- validate (fixed pairs) ----
-        net.eval()
-        va_loss = 0.0
-        with torch.no_grad():
-            for x1, x2, y in val_dl:
-                x1 = x1.to(DEVICE, non_blocking=True)
-                x2 = x2.to(DEVICE, non_blocking=True)
-                y  = y.to(DEVICE, non_blocking=True)
-                z1, z2 = net(x1), net(x2)
-                va_loss += contrastive_loss(z1, z2, y).item()
-        va_loss /= len(val_dl)
+        # Validate
+        val_loss = validate(model, val_loader, criterion, DEVICE)
+        val_losses.append(val_loss)
 
-        print(f"Epoch {epoch:02d}/{EPOCHS}  train_loss={tr_loss:.4f}  val_loss={va_loss:.4f}")
+        # Learning rate step
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
-        # checkpointing
-        torch.save(net.state_dict(), OUT_DIR / "last.pt")
-        if va_loss < best_val:
-            best_val = va_loss
-            torch.save(net.state_dict(), best_path)
-            print(f"  🔥 new best (val_loss={best_val:.4f}) → {best_path}")
+        # Print epoch summary
+        print(f"\nEpoch {epoch} Summary:")
+        print(f"  Train Loss: {train_loss:.4f}")
+        print(f"  Val Loss:   {val_loss:.4f}")
+        print(f"  Learning Rate: {current_lr:.2e}")
 
-    print(f"Done. Best val loss: {best_val:.4f}. Weights at {best_path} and {OUT_DIR/'last.pt'}.")
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  *** NEW BEST MODEL *** (val_loss={best_val_loss:.4f})")
+
+        print("=" * 70)
+        print()
+
+    # Plot training history
+    print("Plotting training history...")
+    plot_training_history(train_losses, val_losses, OUT_DIR / "training_history.png")
+    print()
+
+    # ============== TESTING ==============
+    print("="*70)
+    print("TESTING ON VALIDATION SET")
+    print("="*70)
+    print()
+
+    # Load best model
+    model.load_state_dict(torch.load(best_model_path))
+    model.eval()
+
+    # Compute embeddings
+    print("Computing embeddings...")
+    train_subset = train_df.sample(n=min(3000, len(train_df)), random_state=SEED)
+    test_subset = val_df.sample(n=min(2000, len(val_df)), random_state=SEED)
+
+    train_dataset = ImageDataset(train_subset, size=IMG_SIZE)
+    test_dataset = ImageDataset(test_subset, size=IMG_SIZE)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                             num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=NUM_WORKERS, pin_memory=True)
+
+    train_embeds, train_labels = compute_embeddings(model, train_loader, DEVICE)
+    test_embeds, test_labels = compute_embeddings(model, test_loader, DEVICE)
+
+    # Classify using prototypes
+    print("Classifying test samples...")
+    classifier = PrototypeClassifier()
+    classifier.fit(train_embeds, train_labels)
+    predictions = classifier.predict(test_embeds)
+
+    # Compute metrics
+    accuracy = accuracy_score(test_labels, predictions)
+    cm = confusion_matrix(test_labels, predictions)
+
+    print()
+    print("="*70)
+    print("TEST RESULTS")
+    print("="*70)
+    print(f"\nTest Accuracy: {accuracy:.4f} ({accuracy * 100:.2f}%)")
+    print()
+    print("Confusion Matrix:")
+    print(cm)
+    print("  [Normal→Normal, Normal→Melanoma]")
+    print("  [Melanoma→Normal, Melanoma→Melanoma]")
+    print()
+    print("Classification Report:")
+    print(classification_report(test_labels, predictions, target_names=['Normal', 'Melanoma']))
+    print()
+
+    # Plot confusion matrix
+    plot_confusion_matrix(cm, OUT_DIR / "confusion_matrix.png")
+
+    # Save results
+    results = {
+        'accuracy': float(accuracy),
+        'confusion_matrix': cm.tolist(),
+        'train_losses': train_losses,
+        'val_losses': val_losses
+    }
+
+    import json
+    with open(OUT_DIR / "training_results.json", 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print("="*70)
+    print(f"Training complete! Best model saved to: {best_model_path}")
+    print("="*70)
+
 
 if __name__ == "__main__":
     main()
