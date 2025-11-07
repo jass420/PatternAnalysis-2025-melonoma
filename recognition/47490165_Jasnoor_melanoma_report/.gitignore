@@ -1,0 +1,64 @@
+# Dataset files (too large for git)
+ISIC_2020_Train_DICOM_corrected/
+ISIC_2020_Test_DICOM_corrected/
+ISIC_2020_Train_DICOM_corrected.zip
+ISIC_2020_Test_DICOM_corrected.zip
+ISIC_2020_Training_GroundTruth.csv
+ISIC_2020_Training_GroundTruth_v2.csv
+ISIC_2020_Test_Metadata.csv
+train_mapping.csv
+
+# Python virtual environments
+myenv/
+venv/
+env/
+.venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Model outputs and checkpoints
+outputs/
+*.pth
+*.pt
+*.pkl
+*.h5
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.bak
+
+# Temporary files
+nul
+*.tmp
+*.log
+
+# Test/monitoring scripts (not needed for submission)
+check_progress.py
+convert_dicom_to_png.py
+evaluate.py
+evaluate_fast.py
+monitor_training.py
+show_epochs.py
+view_live_training.py
+watch_training.py
+test_on_actual_test_set.py
+test_siamese_network.py
+run_training.sh

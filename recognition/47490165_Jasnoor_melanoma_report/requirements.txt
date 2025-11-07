@@ -1,0 +1,9 @@
+# Minimal deps for training + tuning a Siamese network
+torch
+torchvision
+torchaudio
+optuna
+numpy
+scikit-learn
+tqdm
+pillow
