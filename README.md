@@ -1,20 +1,22 @@
-# COMP3710 Molonaoma detection
+# COMP3710 Melanoma Detection
 
-**Problem Description** 
-*Medical Context*
+## Problem Description
+
+### Medical Context
 We're solving a binary classification problem for melanoma detection using the ISIC 2020 Kaggle Challenge dataset. The task is to distinguish between:
-Class 0: Normal/Benign skin lesions (25,704 samples)
-Class 1: Melanoma (malignant skin cancer) (457 samples)
-Key Challenges
-Severe Class Imbalance: 98.2% normal vs 1.8% melanoma
-High-Resolution Medical Images: DICOM format, up to 4000×6000 pixels
-Visual Similarity: Early melanoma can look very similar to benign moles
-Target Accuracy: ~80% on test set
-Siamese Network Algorithm
-Architecture Overview
+- **Class 0:** Normal/Benign skin lesions (25,704 samples)
+- **Class 1:** Melanoma (malignant skin cancer) (457 samples)
+
+### Key Challenges
+- **Severe Class Imbalance:** 98.2% normal vs 1.8% melanoma
+- **High-Resolution Medical Images:** DICOM format, up to 4000×6000 pixels
+- **Visual Similarity:** Early melanoma can look very similar to benign moles
+- **Target Accuracy:** ~80% on test set
+
+### Siamese Network Solution
 The Siamese network uses a twin neural network architecture with shared weights to learn similarity between image pairs.
 
-**Algorithm description**
+## Algorithm Description
 
 ### Overview
 The Siamese Network is a twin neural network architecture that learns to distinguish between melanoma and normal skin lesions by learning a similarity metric. Instead of directly predicting classes, it maps images into an embedding space where similar images (same class) are close together and dissimilar images (different classes) are far apart.
