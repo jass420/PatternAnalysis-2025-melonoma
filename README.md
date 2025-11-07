@@ -117,14 +117,41 @@ Objective:
 ### Model Specifications
 - Parameters: ~28 million
 - Embedding dimension: 512
-- Training time: 60-90 minutes (12 epochs)
-- Expected accuracy: 75-85% 
+- Training time: 600 minutes (15 epochs)
+- Accuracy: 80% 
 
 
 **Dependencies**
 
-**Confusion Matrix:**
+```bash
+# Python 3.8+ required
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118  # For CUDA 11.8
+pip install pydicom
+pip install opencv-python
+pip install albumentations
+pip install scikit-learn
+pip install pandas
+pip install numpy
+```
 
+**Required Packages:**
+- `torch >= 2.0.0` - PyTorch deep learning framework with CUDA support
+- `torchvision >= 0.15.0` - Pre-trained models (ResNet50) and transforms
+- `pydicom >= 2.3.0` - Reading DICOM medical image format
+- `opencv-python >= 4.7.0` - Image processing and resizing
+- `albumentations >= 1.3.0` - Advanced data augmentation pipeline
+- `scikit-learn >= 1.2.0` - Train/test splitting and evaluation metrics
+- `pandas >= 1.5.0` - Data handling and CSV operations
+- `numpy >= 1.24.0` - Numerical operations and array processing
+
+**Hardware Requirements:**
+- GPU: NVIDIA GPU with 6GB+ VRAM (tested on RTX series)
+- RAM: 16GB+ recommended (DICOM images are large)
+- Storage: ~40GB for ISIC 2020 dataset
+
+**Confusion Matrix + accuracy:**
+
+After multiple fine tunings and changes to the code, the simese network achieved an accuracy of 80.20% after training for 606 minutes. 
 
 Confusion Matrix:
 [[1598  374]
@@ -134,14 +161,29 @@ Confusion Matrix:
 
 **Pre-processing**
 
-**Training, validation, split justification**
-Multiple changes were made to the training to improve the accuracy. Below is a list of all the accuracies:
+The preprocessing pipeline in [train_and_evaluate.py](train_and_evaluate.py) prepares DICOM medical images for training:
 
-Accuracies:
-80.20%
-45.85%
-77.5%
-48.8%
-68.6%
-66.5%
+**DICOM Loading**: Raw DICOM files are loaded using pydicom. Large images (4000×6000, ~275MB) are downsampled to max 1024×1024 before processing to prevent memory errors. Grayscale images are converted to RGB by stacking 3 channels. Pixel values are normalized to [0,1] range then converted to uint8 [0,255].
+
+**Data Augmentation** (Training): Images are resized to 224×224 and augmented using Albumentations library with random horizontal/vertical flips (p=0.5), rotation (±20°, p=0.5), brightness/contrast adjustments (p=0.3), and Gaussian noise (p=0.2). ImageNet normalization is applied before converting to PyTorch tensors.
+
+**Validation**: Minimal preprocessing with resize to 224×224, ImageNet normalization, and tensor conversion only.
+
+**Pair Generation**: The Siamese network requires image pairs. Positive pairs (same class) and negative pairs (different classes) are generated with balanced sampling to handle the severe class imbalance (98.2% normal vs 1.8% melanoma). 6000 training pairs per epoch (random) and 1200 fixed validation pairs are used.
+
+**Training, validation, split justification**
+
+The dataset is split using GroupShuffleSplit (80% train, 20% validation) grouped by patient_id to prevent data leakage. Multiple iterative improvements were made to achieve the target accuracy:
+
+**Progression (oldest → newest):**
+1. **66.5%** - Initial baseline with ResNet18, 128-dim embeddings, minimal augmentation, IMG_SIZE=256
+2. **68.6%** - Reduced IMG_SIZE to 128 for faster loading, increased batch size to 64
+3. **48.8%** - Attempted hard negative mining (failed - decreased accuracy, reverted). This was done by writing a function which increased the pairing of images in the first class and the second class incstead of same class.
+4. **77.5%** - Upgraded to ResNet50, increased embedding to 512-dim, deeper projection head with BatchNorm/Dropout, increased margin to 2.0
+5. **45.85%** - Adjusted workers/pairs configuration. 
+6. **80.20%** - Final optimized configuration: IMG_SIZE=224, LR=5e-4, cosine annealing scheduler, enhanced augmentations (vertical flip, rotation ±20°, HSV, GaussNoise), memory-efficient DICOM loading, 6000 training pairs, 12 epochs
+
+**Key improvements:** ResNet50 backbone (3× more parameters), 512-dim embeddings (4× larger), deeper 5-layer projection head, larger margin (2.0), learning rate scheduler, richer augmentations, balanced pair sampling for class imbalance (98.2% normal vs 1.8% melanoma).
+
+**Training time:** 606 minutes (15 epochs)
 
